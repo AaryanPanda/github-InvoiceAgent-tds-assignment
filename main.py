@@ -42,7 +42,7 @@ A2A_BASE_URL = os.environ.get("A2A_BASE_URL", "").rstrip("/")   # may be empty -
 AGENT_VERSION = os.environ.get("AGENT_VERSION", "1.0.0")
 
 # Bump this whenever you deploy, so GET / confirms which code is actually live.
-BUILD = "2026-10-21-coverage"
+BUILD = "2026-10-21-parallel"
 
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
@@ -52,7 +52,7 @@ AI_MODEL = os.environ.get("AI_MODEL", "gpt-4o-mini")
 AI_MAX_TOKENS_PER_CALL = int(os.environ.get("AI_MAX_TOKENS_PER_CALL", "5000"))
 # Max packages per model call. Small models (e.g. gpt-4o-mini) get "lazy" and return
 # fewer answers than asked when a batch is large, so we keep each call small and reliable.
-AI_MAX_PKGS_PER_CALL = int(os.environ.get("AI_MAX_PKGS_PER_CALL", "4"))
+AI_MAX_PKGS_PER_CALL = int(os.environ.get("AI_MAX_PKGS_PER_CALL", "6"))
 
 # Optional: when set, GET /debug/last (with header X-Debug-Token) dumps the last few
 # batches + decisions so you can tune the prompt against real packages. Leave UNSET
@@ -223,7 +223,8 @@ SYSTEM_PROMPT = (
     "VERBATIM from this package's governing paragraph. Not two, not four. Three.\n"
     "3. Extract facts: vendorName (string), invoiceNumber (string), amountMinor (integer, the amount in "
     "the smallest currency unit, e.g. rupees*100 or cents), currency (ISO code like INR or USD).\n"
-    "4. rationale: 60 to 1500 characters, name the chosen action and cite at least two of the three refs.\n\n"
+    "4. rationale: ONE concise sentence (aim for 120-220 characters; never exceed 1500). "
+    "Name the chosen action and cite at least two of the three refs. Do not pad it.\n\n"
     "Return STRICT JSON ONLY, shaped as:\n"
     '{"decisions":[{"packageId":"...","action":"...","evidenceRefs":["[..]","[..]","[..]"],'
     '"facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":12345,"currency":"INR"},'
@@ -322,56 +323,64 @@ async def _request_once(client, packages, headers):
     return {}, last
 
 
+async def _resolve_chunk(client, chunk, headers, deadline, retries=1):
+    """Decide one chunk, handling a 413 by splitting and a 429 by one backoff.
+    Returns (decisions_dict, status). Runs concurrently with sibling chunks."""
+    dec, status = await _request_once(client, chunk, headers)
+    if status in ("ok", "ok_no_jsonmode"):
+        return dec, status
+    if status == "too_large" and len(chunk) > 1:
+        mid = len(chunk) // 2
+        (da, sa), (db, sb) = await asyncio.gather(
+            _resolve_chunk(client, chunk[:mid], headers, deadline, retries),
+            _resolve_chunk(client, chunk[mid:], headers, deadline, retries),
+        )
+        merged = {}
+        merged.update(da)
+        merged.update(db)
+        return merged, (sa if da else sb)
+    if status == "rate_limited" and retries > 0 and time.time() < deadline - 5:
+        await asyncio.sleep(3.0)
+        return await _resolve_chunk(client, chunk, headers, deadline, retries - 1)
+    return {}, status
+
+
 async def call_model(packages: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], str]:
-    """Decide packages via the model, splitting into sub-requests that fit under the
-    provider's per-request token cap. Returns ({packageId: decision}, status_string).
-    On a tight free tier some chunks may be rate-limited and left to fall back; the
-    content cache means they can be filled on a later request without repeating work."""
+    """Decide packages via the model. Splits into small chunks (so a small model
+    returns every answer) and runs those chunks CONCURRENTLY (so a 12-package batch
+    costs one call's worth of time, not several). Returns ({packageId: decision}, status)."""
     if not AI_API_KEY:
         return {}, "no_key"
 
     headers = {"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}
     out: Dict[str, Dict[str, Any]] = {}
-    fail = ""
+    last_status = "error:none"
     deadline = time.time() + 36.0  # stay inside the 45s per-request grader budget
 
-    async def process(pkgs: List[Dict[str, Any]], retries_left: int) -> None:
-        nonlocal fail
-        # Stack so a 413 can split a chunk in half and requeue the halves.
-        stack = list(reversed(_chunk_by_tokens(pkgs, AI_MAX_TOKENS_PER_CALL, AI_MAX_PKGS_PER_CALL)))
-        while stack:
-            if time.time() > deadline:
-                fail = fail or "deadline"
-                return
-            chunk = stack.pop()
-            dec, status = await _request_once(client, chunk, headers)
-            if status in ("ok", "ok_no_jsonmode"):
-                out.update(dec)
-            elif status == "too_large" and len(chunk) > 1:
-                mid = len(chunk) // 2
-                stack.append(chunk[mid:])
-                stack.append(chunk[:mid])
-            elif status == "rate_limited" and retries_left > 0 and time.time() < deadline - 5:
-                retries_left -= 1
-                await asyncio.sleep(3.0)
-                stack.append(chunk)  # wait out a little TPM and retry this chunk
-            else:
-                fail = status  # give up this chunk for now
+    async with httpx.AsyncClient(timeout=25) as client:
+        chunks = _chunk_by_tokens(packages, AI_MAX_TOKENS_PER_CALL, AI_MAX_PKGS_PER_CALL)
+        results = await asyncio.gather(
+            *[_resolve_chunk(client, c, headers, deadline) for c in chunks]
+        )
+        for dec, status in results:
+            out.update(dec)
+            if status not in ("ok", "ok_no_jsonmode"):
+                last_status = status
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        await process(packages, retries_left=2)
-        # Gap-fill: re-request any packages the model skipped (small-model laziness),
-        # rather than letting them fall back.
+        # Gap-fill: re-request any packages the model skipped, also in parallel.
         missing = [p for p in packages if pkg_id(p) not in out]
         if missing and time.time() < deadline - 3:
-            await process(missing, retries_left=1)
+            fill_chunks = _chunk_by_tokens(missing, AI_MAX_TOKENS_PER_CALL, AI_MAX_PKGS_PER_CALL)
+            results2 = await asyncio.gather(
+                *[_resolve_chunk(client, c, headers, deadline) for c in fill_chunks]
+            )
+            for dec, _status in results2:
+                out.update(dec)
 
     if not out:
-        return {}, (fail or "error:none")
+        return {}, last_status
     still_missing = sum(1 for p in packages if pkg_id(p) not in out)
-    if still_missing or fail:
-        return out, f"partial:{fail or 'incomplete'}"
-    return out, "ok"
+    return out, ("ok" if still_missing == 0 else "partial:incomplete")
 
 
 def fallback_decision(pkg: Dict[str, Any]) -> Dict[str, Any]:
