@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: a2a-invoice-agent
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # IMPORTANT: --workers 1 is mandatory. All task state lives in memory,
+    # so more than one worker would break idempotency, the cancel/receipt
+    # race, and user isolation.
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
+    envVars:
+      - key: A2A_BASE_URL
+        sync: false        # set to https://<your-app>.onrender.com/a2a
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_BASE_URL
+        value: https://api.openai.com/v1
+      - key: AI_MODEL
+        value: gpt-4o-mini
+      - key: AGENT_VERSION
+        value: 1.0.0
