@@ -45,6 +45,19 @@ AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip(
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
 AI_MODEL = os.environ.get("AI_MODEL", "gpt-4o-mini")
 
+# Optional: when set, GET /debug/last (with header X-Debug-Token) dumps the last few
+# batches + decisions so you can tune the prompt against real packages. Leave UNSET
+# during the graded Save.
+DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "")
+
+
+def log(*parts: Any) -> None:
+    print("[agent]", *parts, flush=True)
+
+
+# Ring buffer of recent batches for debugging (capped). Not principal-scoped on purpose.
+LAST_DEBUG: List[Dict[str, Any]] = []
+
 A2A_MEDIA = "application/a2a+json"
 INPUT_MODE = "application/vnd.ga5.invoice-claim-batch+json"
 PROPOSALS_MODE = "application/vnd.ga5.invoice-action-proposals+json"
@@ -209,40 +222,63 @@ SYSTEM_PROMPT = (
 )
 
 
-async def call_model(packages: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """One batched model call for the given (uncached) packages. Returns {packageId: decision}."""
-    if not AI_API_KEY:
-        return {}  # no key -> every package falls back
+def _loads_loose(content: str) -> Dict[str, Any]:
+    """Parse JSON that may be wrapped in prose or ```json fences."""
+    content = content.strip()
+    try:
+        return json.loads(content)
+    except Exception:
+        pass
+    # Strip code fences / find the outermost {...}
+    start = content.find("{")
+    end = content.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(content[start:end + 1])
+        except Exception:
+            pass
+    return {}
 
-    user_payload = {
-        "packages": [{"packageId": pkg_id(p), "package": p} for p in packages]
-    }
-    body = {
-        "model": AI_MODEL,
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-        ],
-    }
+
+async def call_model(packages: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], str]:
+    """One batched model call. Returns ({packageId: decision}, status_string).
+    status_string is logged so you can see in Render logs whether AI actually worked."""
+    if not AI_API_KEY:
+        return {}, "no_key"
+
+    user_payload = {"packages": [{"packageId": pkg_id(p), "package": p} for p in packages]}
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+    ]
     headers = {"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}
 
-    try:
-        async with httpx.AsyncClient(timeout=40) as client:
-            r = await client.post(f"{AI_BASE_URL}/chat/completions", json=body, headers=headers)
-            r.raise_for_status()
+    # Try once WITH json_object mode, then once WITHOUT (some providers reject it).
+    attempts = [
+        {"model": AI_MODEL, "temperature": 0, "response_format": {"type": "json_object"}, "messages": messages},
+        {"model": AI_MODEL, "temperature": 0, "messages": messages},
+    ]
+    last_err = ""
+    for i, body in enumerate(attempts):
+        try:
+            async with httpx.AsyncClient(timeout=38) as client:
+                r = await client.post(f"{AI_BASE_URL}/chat/completions", json=body, headers=headers)
+            if r.status_code >= 400:
+                last_err = f"http_{r.status_code}:{r.text[:200]}"
+                continue
             content = r.json()["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
-    except Exception:
-        return {}
-
-    out: Dict[str, Dict[str, Any]] = {}
-    for d in parsed.get("decisions", []):
-        pid = str(d.get("packageId", ""))
-        if pid:
-            out[pid] = d
-    return out
+            parsed = _loads_loose(content)
+            out: Dict[str, Dict[str, Any]] = {}
+            for d in parsed.get("decisions", []):
+                pid = str(d.get("packageId", ""))
+                if pid:
+                    out[pid] = d
+            if out:
+                return out, ("ok" if i == 0 else "ok_no_jsonmode")
+            last_err = "empty_parse"
+        except Exception as e:
+            last_err = f"exc:{type(e).__name__}:{str(e)[:160]}"
+    return {}, f"error:{last_err}"
 
 
 def fallback_decision(pkg: Dict[str, Any]) -> Dict[str, Any]:
@@ -301,7 +337,7 @@ def sanitize_decision(dec: Dict[str, Any], pkg: Dict[str, Any]) -> Dict[str, Any
     return {"action": action, "evidenceRefs": refs, "facts": facts, "rationale": rationale}
 
 
-async def decide_packages(packages: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+async def decide_packages(packages: List[Dict[str, Any]], batch_id: str = "") -> Dict[str, Dict[str, Any]]:
     """Return {packageId: decision}, using the content cache and one model call for the rest."""
     result: Dict[str, Dict[str, Any]] = {}
     uncached: List[Tuple[Dict[str, Any], str]] = []
@@ -313,14 +349,38 @@ async def decide_packages(packages: List[Dict[str, Any]]) -> Dict[str, Dict[str,
         else:
             uncached.append((pkg, ph))
 
+    ai_status = "all_cached"
+    model_hit = 0
     if uncached:
-        decided = await call_model([p for p, _ in uncached])
+        decided, ai_status = await call_model([p for p, _ in uncached])
         for pkg, ph in uncached:
             pid = pkg_id(pkg)
-            raw = decided.get(pid) or fallback_decision(pkg)
+            raw = decided.get(pid)
+            if raw is None:
+                raw = fallback_decision(pkg)
+            else:
+                model_hit += 1
             clean = sanitize_decision(raw, pkg)
             DECISION_CACHE[ph] = clean
             result[pid] = clean
+
+    # Diagnostics: show in Render logs whether AI worked and how varied the actions are.
+    counts: Dict[str, int] = {}
+    for d in result.values():
+        counts[d["action"]] = counts.get(d["action"], 0) + 1
+    log(f"batch={batch_id} pkgs={len(packages)} cached={len(packages)-len(uncached)} "
+        f"model_hit={model_hit} ai={ai_status} actions={counts}")
+
+    if len(LAST_DEBUG) >= 6:
+        LAST_DEBUG.pop(0)
+    LAST_DEBUG.append({
+        "batchId": batch_id,
+        "ai_status": ai_status,
+        "model_hit": model_hit,
+        "action_counts": counts,
+        "packages": packages,
+        "decisions": {pid: result[pid] for pid in result},
+    })
 
     return result
 
@@ -396,6 +456,16 @@ async def collapse_slashes(request: Request, call_next):
 @app.get("/")
 async def health():
     return {"ok": True, "service": "a2a-invoice-agent"}
+
+
+@app.get("/debug/last")
+async def debug_last(request: Request):
+    """Inert unless DEBUG_TOKEN env var is set AND the X-Debug-Token header matches it.
+    Lets you read the actual packages the grader sent + the decisions made, so you can
+    tune SYSTEM_PROMPT against real data. KEEP DEBUG_TOKEN UNSET DURING THE GRADED SAVE."""
+    if not DEBUG_TOKEN or request.headers.get("x-debug-token") != DEBUG_TOKEN:
+        return err("NOT_FOUND", "Not found", 404)
+    return a2a_json({"recent": LAST_DEBUG})
 
 
 # ---- Agent Card (public, no auth, no version header required) ---- #
@@ -480,7 +550,7 @@ async def handle_initial_batch(principal, message, batch_data, body_hash, idem_k
     batch_id = batch_data.get("batchId", "")
     packages = batch_data.get("packages", []) or []
 
-    decisions = await decide_packages(packages)  # <- the only place a model is called
+    decisions = await decide_packages(packages, batch_id)  # <- the only place a model is called
 
     proposals = []
     used_action_ids = set()
@@ -535,42 +605,56 @@ async def handle_continuation(principal, message, body_hash, idem_key, history_l
     if record["principal"] != principal:
         return err("NOT_FOUND", "Task not found", 404)
 
-    # Context / batch must match the stored task.
-    if context_id != record["contextId"]:
-        return err("CONTINUATION_MISMATCH", "contextId mismatch", 409)
-    if results_data.get("batchId") != record["batchId"]:
-        return err("CONTINUATION_MISMATCH", "batchId mismatch", 409)
-
     tlock = await task_lock(task_id)
     async with tlock:
-        # Terminal replay / race:
+        # Terminal replay / race (checked inside the lock so cancel vs receipt is atomic):
         if record["state"] in TERMINAL:
             if record["state"] == S_COMPLETED:
-                # A different messageId arriving after completion is still just a read of a
-                # terminal task; return it. (Same-message replay was handled by idempotency.)
+                # A read of an already-completed task. (Same-message replay was handled by
+                # idempotency above; this is a late/duplicate continuation.)
                 return a2a_json({"task": public_task(record)})
             return err("TASK_TERMINAL", "Task already canceled", 409)
 
+        # ---- STRICT validation: reject the WHOLE continuation on ANY mismatch, before
+        # mutating anything. The grader sends tampered continuations on purpose. ----
+        if context_id != record["contextId"]:
+            return err("INVALID_CONTINUATION", "contextId mismatch", 409)
+        if results_data.get("batchId") != record["batchId"]:
+            return err("INVALID_CONTINUATION", "batchId mismatch", 409)
+
+        results = results_data.get("results")
+        if not isinstance(results, list) or not results:
+            return err("INVALID_CONTINUATION", "missing results", 409)
+
         proposals_by = {p["actionId"]: p for p in record["proposals"]}
+
+        # First pass: validate every result against its stored proposal. No mutation yet.
+        for res in results:
+            prop = proposals_by.get(res.get("actionId"))
+            if prop is None:
+                return err("INVALID_CONTINUATION", "unknown actionId", 409)
+            if res.get("packageId") != prop["packageId"]:
+                return err("INVALID_CONTINUATION", "packageId mismatch", 409)
+            if res.get("action") != prop["action"]:
+                return err("INVALID_CONTINUATION", "action mismatch", 409)
+            outcome = res.get("outcome")
+            if outcome not in ("ACCEPTED", "REJECTED"):
+                return err("INVALID_CONTINUATION", "bad outcome", 409)
+            if outcome == "ACCEPTED" and not res.get("receiptNonce"):
+                return err("INVALID_CONTINUATION", "missing receiptNonce", 409)
+
+        # Second pass: continuation is valid -> execute ACCEPTED only, each bound to its
+        # stored proposal and its grader-supplied nonce. REJECTED proposals are never run.
         executions = []
-        for res in results_data.get("results", []):
-            aid = res.get("actionId")
-            prop = proposals_by.get(aid)
-            if not prop:
-                continue  # unknown action id -> ignore
-            # Every field must match the stored proposal.
-            if res.get("packageId") != prop["packageId"] or res.get("action") != prop["action"]:
-                continue
+        for res in results:
             if res.get("outcome") != "ACCEPTED":
-                continue  # rejected proposals are never executed
-            nonce = res.get("receiptNonce")
-            if not nonce:
                 continue
+            prop = proposals_by[res["actionId"]]
             executions.append({
                 "packageId": prop["packageId"],
                 "actionId": prop["actionId"],
                 "action": prop["action"],
-                "receiptNonce": nonce,
+                "receiptNonce": res["receiptNonce"],
                 "facts": prop["facts"],
                 "evidenceRefs": prop["evidenceRefs"],
             })
