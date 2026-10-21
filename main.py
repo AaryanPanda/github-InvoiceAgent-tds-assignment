@@ -41,6 +41,9 @@ from fastapi.responses import JSONResponse
 A2A_BASE_URL = os.environ.get("A2A_BASE_URL", "").rstrip("/")   # may be empty -> auto-detect
 AGENT_VERSION = os.environ.get("AGENT_VERSION", "1.0.0")
 
+# Bump this whenever you deploy, so GET / confirms which code is actually live.
+BUILD = "2026-10-21-chunking"
+
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
 AI_MODEL = os.environ.get("AI_MODEL", "gpt-4o-mini")
@@ -514,6 +517,8 @@ def extract_part(message: Dict[str, Any], media: str) -> Optional[Dict[str, Any]
 # --------------------------------------------------------------------------- #
 app = FastAPI()
 app.router.redirect_slashes = False  # never redirect the grader
+log(f"startup build={BUILD} model={AI_MODEL} base={AI_BASE_URL} "
+    f"ai_key_set={bool(AI_API_KEY)} max_tokens_per_call={AI_MAX_TOKENS_PER_CALL}")
 
 
 @app.middleware("http")
@@ -529,7 +534,8 @@ async def collapse_slashes(request: Request, call_next):
 
 @app.get("/")
 async def health():
-    return {"ok": True, "service": "a2a-invoice-agent"}
+    return {"ok": True, "service": "a2a-invoice-agent", "build": BUILD,
+            "model": AI_MODEL, "ai_key_set": bool(AI_API_KEY)}
 
 
 @app.get("/debug/last")
