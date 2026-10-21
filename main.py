@@ -42,7 +42,7 @@ A2A_BASE_URL = os.environ.get("A2A_BASE_URL", "").rstrip("/")   # may be empty -
 AGENT_VERSION = os.environ.get("AGENT_VERSION", "1.0.0")
 
 # Bump this whenever you deploy, so GET / confirms which code is actually live.
-BUILD = "2026-10-21-chunking"
+BUILD = "2026-10-21-coverage"
 
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
@@ -50,6 +50,9 @@ AI_MODEL = os.environ.get("AI_MODEL", "gpt-4o-mini")
 # Max estimated tokens per model request; batches are split to stay under this so a
 # low per-request / TPM cap (e.g. Groq free tier = 8000 TPM) doesn't 413 the whole batch.
 AI_MAX_TOKENS_PER_CALL = int(os.environ.get("AI_MAX_TOKENS_PER_CALL", "5000"))
+# Max packages per model call. Small models (e.g. gpt-4o-mini) get "lazy" and return
+# fewer answers than asked when a batch is large, so we keep each call small and reliable.
+AI_MAX_PKGS_PER_CALL = int(os.environ.get("AI_MAX_PKGS_PER_CALL", "4"))
 
 # Optional: when set, GET /debug/last (with header X-Debug-Token) dumps the last few
 # batches + decisions so you can tune the prompt against real packages. Leave UNSET
@@ -251,16 +254,18 @@ def _est_tokens(obj: Any) -> int:
     return max(1, len(canonical(obj)) // 3)
 
 
-def _chunk_by_tokens(packages: List[Dict[str, Any]], budget: int) -> List[List[Dict[str, Any]]]:
-    """Split packages so each chunk's estimated token cost stays under `budget`.
-    Keeps a single oversized package in its own chunk (handled further by 413-splitting)."""
+def _chunk_by_tokens(packages: List[Dict[str, Any]], budget: int,
+                     max_pkgs: int = 1000) -> List[List[Dict[str, Any]]]:
+    """Split packages so each chunk stays under `budget` tokens AND holds at most
+    `max_pkgs` packages. The package cap keeps each call small enough that a small
+    model reliably returns every answer."""
     base = len(SYSTEM_PROMPT) // 3 + 60
     chunks: List[List[Dict[str, Any]]] = []
     cur: List[Dict[str, Any]] = []
     cur_tok = 0
     for p in packages:
         t = _est_tokens(p)
-        if cur and cur_tok + t + base > budget:
+        if cur and (len(cur) >= max_pkgs or cur_tok + t + base > budget):
             chunks.append(cur)
             cur, cur_tok = [], 0
         cur.append(p)
@@ -328,16 +333,16 @@ async def call_model(packages: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str
     headers = {"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}
     out: Dict[str, Dict[str, Any]] = {}
     fail = ""
-    retries_left = 2
     deadline = time.time() + 36.0  # stay inside the 45s per-request grader budget
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        # Process as a stack so a 413 can split a chunk in half and requeue the halves.
-        stack = list(reversed(_chunk_by_tokens(packages, AI_MAX_TOKENS_PER_CALL)))
+    async def process(pkgs: List[Dict[str, Any]], retries_left: int) -> None:
+        nonlocal fail
+        # Stack so a 413 can split a chunk in half and requeue the halves.
+        stack = list(reversed(_chunk_by_tokens(pkgs, AI_MAX_TOKENS_PER_CALL, AI_MAX_PKGS_PER_CALL)))
         while stack:
             if time.time() > deadline:
                 fail = fail or "deadline"
-                break
+                return
             chunk = stack.pop()
             dec, status = await _request_once(client, chunk, headers)
             if status in ("ok", "ok_no_jsonmode"):
@@ -351,11 +356,22 @@ async def call_model(packages: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str
                 await asyncio.sleep(3.0)
                 stack.append(chunk)  # wait out a little TPM and retry this chunk
             else:
-                fail = status  # give up this chunk; its packages will fall back
+                fail = status  # give up this chunk for now
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        await process(packages, retries_left=2)
+        # Gap-fill: re-request any packages the model skipped (small-model laziness),
+        # rather than letting them fall back.
+        missing = [p for p in packages if pkg_id(p) not in out]
+        if missing and time.time() < deadline - 3:
+            await process(missing, retries_left=1)
 
     if not out:
         return {}, (fail or "error:none")
-    return out, ("ok" if not fail else f"partial:{fail}")
+    still_missing = sum(1 for p in packages if pkg_id(p) not in out)
+    if still_missing or fail:
+        return out, f"partial:{fail or 'incomplete'}"
+    return out, "ok"
 
 
 def fallback_decision(pkg: Dict[str, Any]) -> Dict[str, Any]:
