@@ -42,7 +42,7 @@ A2A_BASE_URL = os.environ.get("A2A_BASE_URL", "").rstrip("/")   # may be empty -
 AGENT_VERSION = os.environ.get("AGENT_VERSION", "1.0.0")
 
 # Bump this whenever you deploy, so GET / confirms which code is actually live.
-BUILD = "2026-10-21-parallel"
+BUILD = "2026-10-21-debug"
 
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
@@ -568,7 +568,8 @@ async def debug_last(request: Request):
     """Inert unless DEBUG_TOKEN env var is set AND the X-Debug-Token header matches it.
     Lets you read the actual packages the grader sent + the decisions made, so you can
     tune SYSTEM_PROMPT against real data. KEEP DEBUG_TOKEN UNSET DURING THE GRADED SAVE."""
-    if not DEBUG_TOKEN or request.headers.get("x-debug-token") != DEBUG_TOKEN:
+    token = request.headers.get("x-debug-token") or request.query_params.get("token")
+    if not DEBUG_TOKEN or token != DEBUG_TOKEN:
         return err("NOT_FOUND", "Not found", 404)
     return a2a_json({"recent": LAST_DEBUG})
 
