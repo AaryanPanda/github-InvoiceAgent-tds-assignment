@@ -44,6 +44,9 @@ AGENT_VERSION = os.environ.get("AGENT_VERSION", "1.0.0")
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
 AI_MODEL = os.environ.get("AI_MODEL", "gpt-4o-mini")
+# Max estimated tokens per model request; batches are split to stay under this so a
+# low per-request / TPM cap (e.g. Groq free tier = 8000 TPM) doesn't 413 the whole batch.
+AI_MAX_TOKENS_PER_CALL = int(os.environ.get("AI_MAX_TOKENS_PER_CALL", "5000"))
 
 # Optional: when set, GET /debug/last (with header X-Debug-Token) dumps the last few
 # batches + decisions so you can tune the prompt against real packages. Leave UNSET
@@ -240,45 +243,116 @@ def _loads_loose(content: str) -> Dict[str, Any]:
     return {}
 
 
-async def call_model(packages: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], str]:
-    """One batched model call. Returns ({packageId: decision}, status_string).
-    status_string is logged so you can see in Render logs whether AI actually worked."""
-    if not AI_API_KEY:
-        return {}, "no_key"
+def _est_tokens(obj: Any) -> int:
+    """Rough token estimate: ~3 chars per token for compact JSON."""
+    return max(1, len(canonical(obj)) // 3)
 
+
+def _chunk_by_tokens(packages: List[Dict[str, Any]], budget: int) -> List[List[Dict[str, Any]]]:
+    """Split packages so each chunk's estimated token cost stays under `budget`.
+    Keeps a single oversized package in its own chunk (handled further by 413-splitting)."""
+    base = len(SYSTEM_PROMPT) // 3 + 60
+    chunks: List[List[Dict[str, Any]]] = []
+    cur: List[Dict[str, Any]] = []
+    cur_tok = 0
+    for p in packages:
+        t = _est_tokens(p)
+        if cur and cur_tok + t + base > budget:
+            chunks.append(cur)
+            cur, cur_tok = [], 0
+        cur.append(p)
+        cur_tok += t
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+async def _request_once(client, packages, headers):
+    """One HTTP attempt for one chunk. Returns (decisions, status) with status in
+    {ok, ok_no_jsonmode, too_large, rate_limited, error:...}."""
     user_payload = {"packages": [{"packageId": pkg_id(p), "package": p} for p in packages]}
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
     ]
-    headers = {"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}
-
-    # Try once WITH json_object mode, then once WITHOUT (some providers reject it).
-    attempts = [
+    bodies = [
         {"model": AI_MODEL, "temperature": 0, "response_format": {"type": "json_object"}, "messages": messages},
         {"model": AI_MODEL, "temperature": 0, "messages": messages},
     ]
-    last_err = ""
-    for i, body in enumerate(attempts):
+    if AI_MODEL.startswith("openai/gpt-oss"):
+        for b in bodies:
+            b["reasoning_effort"] = "low"  # fewer reasoning tokens -> less TPM, faster
+
+    last = "error:unknown"
+    for i, body in enumerate(bodies):
         try:
-            async with httpx.AsyncClient(timeout=38) as client:
-                r = await client.post(f"{AI_BASE_URL}/chat/completions", json=body, headers=headers)
-            if r.status_code >= 400:
-                last_err = f"http_{r.status_code}:{r.text[:200]}"
-                continue
-            content = r.json()["choices"][0]["message"]["content"]
-            parsed = _loads_loose(content)
-            out: Dict[str, Dict[str, Any]] = {}
-            for d in parsed.get("decisions", []):
-                pid = str(d.get("packageId", ""))
-                if pid:
-                    out[pid] = d
-            if out:
-                return out, ("ok" if i == 0 else "ok_no_jsonmode")
-            last_err = "empty_parse"
+            r = await client.post(f"{AI_BASE_URL}/chat/completions", json=body, headers=headers)
         except Exception as e:
-            last_err = f"exc:{type(e).__name__}:{str(e)[:160]}"
-    return {}, f"error:{last_err}"
+            last = f"error:exc:{type(e).__name__}"
+            continue
+        if r.status_code == 413:
+            return {}, "too_large"
+        if r.status_code == 429:
+            return {}, "rate_limited"
+        if r.status_code >= 400:
+            last = f"error:http_{r.status_code}"
+            continue  # e.g. json_object unsupported -> try the plain body
+        try:
+            content = r.json()["choices"][0]["message"]["content"]
+        except Exception:
+            last = "error:badresp"
+            continue
+        parsed = _loads_loose(content)
+        out: Dict[str, Dict[str, Any]] = {}
+        for d in parsed.get("decisions", []):
+            pid = str(d.get("packageId", ""))
+            if pid:
+                out[pid] = d
+        if out:
+            return out, ("ok" if i == 0 else "ok_no_jsonmode")
+        last = "error:empty_parse"
+    return {}, last
+
+
+async def call_model(packages: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], str]:
+    """Decide packages via the model, splitting into sub-requests that fit under the
+    provider's per-request token cap. Returns ({packageId: decision}, status_string).
+    On a tight free tier some chunks may be rate-limited and left to fall back; the
+    content cache means they can be filled on a later request without repeating work."""
+    if not AI_API_KEY:
+        return {}, "no_key"
+
+    headers = {"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}
+    out: Dict[str, Dict[str, Any]] = {}
+    fail = ""
+    retries_left = 2
+    deadline = time.time() + 36.0  # stay inside the 45s per-request grader budget
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        # Process as a stack so a 413 can split a chunk in half and requeue the halves.
+        stack = list(reversed(_chunk_by_tokens(packages, AI_MAX_TOKENS_PER_CALL)))
+        while stack:
+            if time.time() > deadline:
+                fail = fail or "deadline"
+                break
+            chunk = stack.pop()
+            dec, status = await _request_once(client, chunk, headers)
+            if status in ("ok", "ok_no_jsonmode"):
+                out.update(dec)
+            elif status == "too_large" and len(chunk) > 1:
+                mid = len(chunk) // 2
+                stack.append(chunk[mid:])
+                stack.append(chunk[:mid])
+            elif status == "rate_limited" and retries_left > 0 and time.time() < deadline - 5:
+                retries_left -= 1
+                await asyncio.sleep(3.0)
+                stack.append(chunk)  # wait out a little TPM and retry this chunk
+            else:
+                fail = status  # give up this chunk; its packages will fall back
+
+    if not out:
+        return {}, (fail or "error:none")
+    return out, ("ok" if not fail else f"partial:{fail}")
 
 
 def fallback_decision(pkg: Dict[str, Any]) -> Dict[str, Any]:
