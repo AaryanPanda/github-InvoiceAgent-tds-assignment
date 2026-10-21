@@ -42,7 +42,7 @@ A2A_BASE_URL = os.environ.get("A2A_BASE_URL", "").rstrip("/")   # may be empty -
 AGENT_VERSION = os.environ.get("AGENT_VERSION", "1.0.0")
 
 # Bump this whenever you deploy, so GET / confirms which code is actually live.
-BUILD = "2026-10-21-evidence"
+BUILD = "2026-10-21-rationale"
 
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
@@ -244,8 +244,11 @@ SYSTEM_PROMPT = (
     "- A clean match that is merely over the authority limit = request_approval, NOT settle.\n\n"
     "From the IDENTIFIERS line extract facts: vendorName, invoiceNumber, amountMinor (integer in the "
     "smallest unit, e.g. EUR 32234.22 -> 3223422), currency (ISO code).\n"
-    "rationale: ONE concise sentence naming the action and the deciding fact; cite at least two of "
-    "the provided refs. 120-220 chars, never exceed 1500.\n\n"
+    "rationale: ONE sentence that (a) names the chosen action, (b) states the SPECIFIC deciding "
+    "fact from THIS situation that forces it -- the concrete reason, never a generic phrase like "
+    "'decided from the governing paragraph' -- and (c) cites at least two of the provided refs. "
+    "Example: 'hold_invoice: a requested destination-account change is unverified and remittance is "
+    "barred until the known-number callback closes [R_AAA] [R_BBB].' Aim 130-260 chars, max 1500.\n\n"
     "Return STRICT JSON ONLY: "
     '{"decisions":[{"packageId":"...","action":"...",'
     '"facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":12345,"currency":"INR"},'
@@ -509,13 +512,19 @@ def sanitize_decision(dec: Dict[str, Any], pkg: Dict[str, Any]) -> Dict[str, Any
         "currency": str(facts.get("currency", "INR")) or "INR",
     }
 
+    # Keep the model's explanation (it describes WHY the evidence implies the action);
+    # only repair what the schema needs: name the action, cite >=2 refs, length 60-1500.
     rationale = str(dec.get("rationale", "")).strip()
-    if action not in rationale or sum(r in rationale for r in refs[:2]) < 2 or not (60 <= len(rationale) <= 1500):
-        rationale = (f"{action}: decided from the governing paragraph of this package, "
-                     f"supported by {refs[0]} and {refs[1]} (also {refs[2]}).")
+    if len(rationale) < 40:
+        case = extract_case(pkg)
+        rationale = f"{action}: {case.get('situation', '')}".strip()
+    if action not in rationale:
+        rationale = f"{action}: {rationale}"
+    if sum(r in rationale for r in refs) < 2:
+        rationale = f"{rationale} (evidence: {refs[0]}, {refs[1]}, {refs[2]})"
     rationale = rationale[:1500]
     if len(rationale) < 60:
-        rationale = (rationale + " " + " ".join(refs))[:1500].ljust(60)
+        rationale = (rationale + " " + " ".join(refs)).ljust(60)[:1500]
 
     return {"action": action, "evidenceRefs": refs, "facts": facts, "rationale": rationale}
 
