@@ -4,10 +4,11 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    # IMPORTANT: --workers 1 is mandatory. All task state lives in memory,
-    # so more than one worker would break idempotency, the cancel/receipt
-    # race, and user isolation.
-    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
+    # IMPORTANT: one worker only. All task state lives in memory, so more than
+    # one worker would break idempotency, the cancel/receipt race, and user
+    # isolation. Render's free tier also sets WEB_CONCURRENCY=1 by default,
+    # which keeps it to one worker even without the flag.
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
     envVars:
       - key: A2A_BASE_URL
         sync: false        # set to https://<your-app>.onrender.com/a2a
