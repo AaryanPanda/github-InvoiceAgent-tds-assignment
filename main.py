@@ -42,7 +42,7 @@ A2A_BASE_URL = os.environ.get("A2A_BASE_URL", "").rstrip("/")   # may be empty -
 AGENT_VERSION = os.environ.get("AGENT_VERSION", "1.0.0")
 
 # Bump this whenever you deploy, so GET / confirms which code is actually live.
-BUILD = "2026-10-21-debug"
+BUILD = "2026-10-21-evidence"
 
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
@@ -52,7 +52,7 @@ AI_MODEL = os.environ.get("AI_MODEL", "gpt-4o-mini")
 AI_MAX_TOKENS_PER_CALL = int(os.environ.get("AI_MAX_TOKENS_PER_CALL", "5000"))
 # Max packages per model call. Small models (e.g. gpt-4o-mini) get "lazy" and return
 # fewer answers than asked when a batch is large, so we keep each call small and reliable.
-AI_MAX_PKGS_PER_CALL = int(os.environ.get("AI_MAX_PKGS_PER_CALL", "6"))
+AI_MAX_PKGS_PER_CALL = int(os.environ.get("AI_MAX_PKGS_PER_CALL", "4"))
 
 # Optional: when set, GET /debug/last (with header X-Debug-Token) dumps the last few
 # batches + decisions so you can tune the prompt against real packages. Leave UNSET
@@ -206,27 +206,48 @@ def find_brackets(obj: Any) -> List[str]:
 # AI decision layer
 # --------------------------------------------------------------------------- #
 SYSTEM_PROMPT = (
-    "You are an invoice action agent. For EACH invoice package you receive, choose "
-    "exactly ONE action and cite the exact decisive evidence.\n\n"
-    "Actions (pick exactly one per package):\n"
-    "- settle_invoice: valid, reconciled, and within autonomous authority.\n"
-    "- request_approval: commercially valid, but the amount/terms are OUTSIDE delegated authority.\n"
-    "- hold_invoice: payment pauses until a stated verification completes.\n"
-    "- reject_duplicate: the SAME commercial invoice was already paid (same vendor+invoice number+amount). "
-    "A payment for a different invoice is NOT a duplicate.\n"
-    "- open_exception: material records conflict and need an exception workflow.\n\n"
-    "Rules:\n"
-    "1. The documents MIX useful facts with old archive examples, negation, and irrelevant action "
-    "words. Decide ONLY from the paragraph that actually governs this invoice. Ignore cover-sheet "
-    "references, archive examples, and training decoys.\n"
-    "2. evidenceRefs MUST be EXACTLY THREE bracketed references (like [PAY-12] or [POLICY-4]) copied "
-    "VERBATIM from this package's governing paragraph. Not two, not four. Three.\n"
-    "3. Extract facts: vendorName (string), invoiceNumber (string), amountMinor (integer, the amount in "
-    "the smallest currency unit, e.g. rupees*100 or cents), currency (ISO code like INR or USD).\n"
-    "4. rationale: ONE concise sentence (aim for 120-220 characters; never exceed 1500). "
-    "Name the chosen action and cite at least two of the three refs. Do not pad it.\n\n"
-    "Return STRICT JSON ONLY, shaped as:\n"
-    '{"decisions":[{"packageId":"...","action":"...","evidenceRefs":["[..]","[..]","[..]"],'
+    "You are an invoice action agent. For EACH case, read its SITUATION (the decisive "
+    "sentences that govern this invoice) and choose exactly ONE action. Decide ONLY from "
+    "the SITUATION text; do not invent facts.\n\n"
+    "THE FIVE ACTIONS and how to recognise each:\n\n"
+    "settle_invoice -> the invoice reconciles and can be paid now, within authority, and it is "
+    "NOT a duplicate. Signals: 'three-way match with no exception', 'recalculation/recomputation "
+    "produces the same payable total', 'accepted-goods/inspection record covers every billed unit / "
+    "invoiced quantity received', 'duplicate-control returned no prior settlement', 'no paid item "
+    "with this commercial identity'.\n\n"
+    "request_approval -> commercially valid and fully reconciled (clean three-way match), BUT the "
+    "amount is OUTSIDE this operator's authority and needs a named approver. Signals: 'outside the "
+    "operator's EUR/USD/INR <amount> authority', 'exceeds the autonomous delegation ceiling / above "
+    "that ceiling', 'requires the financial-approval workflow / a named financial approver', 'may act "
+    "without escalation only up to X, which is below the stated total'. The ONLY problem is the "
+    "amount limit; nothing is in dispute or pending.\n\n"
+    "hold_invoice -> everything is otherwise fine but a VERIFICATION IS PENDING, so pause until it "
+    "closes. Signals: 'requested destination-account / beneficiary / bank-detail / payee change', "
+    "'callback has neither confirmed nor rejected it', 'verification through the pre-existing contact "
+    "channel has not completed', 'out-of-band check is pending', 'forbids/pauses remittance until the "
+    "check/callback closes'. The records are NOT in conflict; we are only WAITING.\n\n"
+    "reject_duplicate -> THIS SAME invoice was already paid. Signals: 'a completed/prior payment has "
+    "the same commercial key after normalization', 'earlier posting/settled entry for the SAME "
+    "supplier, invoice identifier, currency AND total', 'a second scan of the SAME signed instrument "
+    "(only OCR/punctuation/spacing differs)', 'prohibits a second disbursement'.\n\n"
+    "open_exception -> the records genuinely CONFLICT and cannot be reconciled now. Signals: 'line "
+    "extension conflicts with the receiving valuation beyond tolerance', 'outside the permitted "
+    "reconciliation tolerance', 'procurement and supplier give incompatible/contradictory "
+    "explanations and neither issued a correction', 'policy bars settlement or simple hold and "
+    "requires a dedicated exception'.\n\n"
+    "CRITICAL DISAMBIGUATION:\n"
+    "- DIFFERENT invoice is NOT a duplicate: if a prior payment was to the same supplier for the same "
+    "amount but a DIFFERENT signed invoice, and THIS invoice has its own valid PO/receiving record "
+    "and was itself never paid -> that is settle_invoice, NOT reject_duplicate.\n"
+    "- hold vs open_exception: 'waiting for a verification/callback to close' = hold_invoice; "
+    "'records contradict beyond tolerance, unresolved' = open_exception.\n"
+    "- A clean match that is merely over the authority limit = request_approval, NOT settle.\n\n"
+    "From the IDENTIFIERS line extract facts: vendorName, invoiceNumber, amountMinor (integer in the "
+    "smallest unit, e.g. EUR 32234.22 -> 3223422), currency (ISO code).\n"
+    "rationale: ONE concise sentence naming the action and the deciding fact; cite at least two of "
+    "the provided refs. 120-220 chars, never exceed 1500.\n\n"
+    "Return STRICT JSON ONLY: "
+    '{"decisions":[{"packageId":"...","action":"...",'
     '"facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":12345,"currency":"INR"},'
     '"rationale":"..."}]}'
 )
@@ -248,6 +269,66 @@ def _loads_loose(content: str) -> Dict[str, Any]:
         except Exception:
             pass
     return {}
+
+
+REF_RE = re.compile(r"\[R_[A-Z0-9]+\]")
+
+
+def _docs_of(pkg: Dict[str, Any]) -> List[Dict[str, str]]:
+    docs = pkg.get("documents")
+    if isinstance(docs, list):
+        return [d for d in docs if isinstance(d, dict)]
+    return []
+
+
+def governing_refs(pkg: Dict[str, Any]) -> List[str]:
+    """The three decisive evidence refs. Structure is regular: the
+    'ledger-and-correspondence' document carries exactly the 3 governing refs
+    (cover sheet has 1 decoy, policy notes have 2 decoys). Robust fallbacks follow."""
+    docs = _docs_of(pkg)
+    # 1) the ledger document's refs, if there are exactly three
+    for d in docs:
+        if "ledger" in d.get("name", "").lower():
+            r = REF_RE.findall(d.get("text", ""))
+            if len(r) == 3:
+                return r
+    # 2) any single document that contains exactly three refs
+    for d in docs:
+        r = REF_RE.findall(d.get("text", ""))
+        if len(r) == 3:
+            return r
+    # 3) fall back to the first three refs anywhere in the package
+    allrefs: List[str] = []
+    for r in REF_RE.findall(canonical(pkg)):
+        if r not in allrefs:
+            allrefs.append(r)
+    return allrefs[:3]
+
+
+def extract_case(pkg: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact, decoy-free view for the model: the decisive sentences + identifiers."""
+    docs = _docs_of(pkg)
+    refs = governing_refs(pkg)
+    ledger = next((d.get("text", "") for d in docs if "ledger" in d.get("name", "").lower()), "")
+    cover = next((d.get("text", "") for d in docs
+                  if "cover" in d.get("name", "").lower() or "intake" in d.get("name", "").lower()), "")
+
+    # Situation = the sentences that contain the governing refs (the real paragraph).
+    situation = ""
+    if ledger and refs:
+        sents = re.split(r"(?<=[.!?])\s+", ledger)
+        keep = [s.strip() for s in sents if any(ref in s for ref in refs)]
+        situation = " ".join(keep).strip()
+    if not situation:
+        # fallback: first paragraph of the ledger, else the whole package text
+        situation = (ledger.split("\n\n")[0].strip() if ledger else canonical(pkg)[:1200])
+
+    identifiers = cover.split("\n\n")[0].strip() if cover else ""
+    if not identifiers:
+        identifiers = canonical(pkg)[:400]
+
+    return {"packageId": pkg_id(pkg), "situation": situation,
+            "identifiers": identifiers, "refs": refs}
 
 
 def _est_tokens(obj: Any) -> int:
@@ -279,7 +360,7 @@ def _chunk_by_tokens(packages: List[Dict[str, Any]], budget: int,
 async def _request_once(client, packages, headers):
     """One HTTP attempt for one chunk. Returns (decisions, status) with status in
     {ok, ok_no_jsonmode, too_large, rate_limited, error:...}."""
-    user_payload = {"packages": [{"packageId": pkg_id(p), "package": p} for p in packages]}
+    user_payload = {"cases": [extract_case(p) for p in packages]}
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
@@ -385,7 +466,7 @@ async def call_model(packages: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str
 
 def fallback_decision(pkg: Dict[str, Any]) -> Dict[str, Any]:
     """Used only when the model is unavailable or skipped a package. Conservative escalate."""
-    refs = find_brackets(pkg)[:3]
+    refs = governing_refs(pkg)[:3]
     while len(refs) < 3:
         refs.append("[n/a]")
     return {
@@ -403,10 +484,10 @@ def sanitize_decision(dec: Dict[str, Any], pkg: Dict[str, Any]) -> Dict[str, Any
     if action not in VALID_ACTIONS:
         action = "open_exception"
 
-    refs = dec.get("evidenceRefs") or []
-    refs = [str(x) for x in refs if str(x).strip()]
-    if len(refs) > 3:
-        refs = refs[:3]
+    # Evidence refs are derived from the package structure, NOT from the model
+    # (the model used to hallucinate / borrow another package's refs).
+    refs = governing_refs(pkg)
+    refs = [str(x) for x in refs if str(x).strip()][:3]
     if len(refs) < 3:
         for b in find_brackets(pkg):
             if b not in refs:
